@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node.js
+node_modules/
+
+# Arquivos locais de execução
+/config.json
+/tela_referencia.png
+/stockfish_temp/
+/stockfish.exe
+/stockfish.zip
+/stockfish-win.zip
+
+# Artefatos de depuração gerados em tempo de execução
+/debug_sessao.log
+/debug_leitura_*.png
+/debug_sintetico_*.png
+/debug_tela.png
+/debug_tabuleiro.png
+
+# Protótipos e utilitários fora do escopo do programa atual
+/main.py
+/detector.py
+/motor.py
+/main.js
+/overlay.html
+/overlay.css
+/overlay.js
+/debug-fen.js
+/calibrar.py
+/capturar_referencias.py

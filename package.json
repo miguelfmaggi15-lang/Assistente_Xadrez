@@ -1,0 +1,20 @@
+{
+  "name": "assistente-xadrez",
+  "version": "1.0.0",
+  "description": "Assistente de xadrez que lê o tabuleiro do chess.com e sugere a melhor jogada com Stockfish",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "stockfish": "^19.0.1"
+  },
+  "keywords": [
+    "chess",
+    "assistant",
+    "opencv",
+    "stockfish"
+  ],
+  "author": "Miguel Maggi",
+  "license": "MIT"
+}
