@@ -111,6 +111,8 @@ matching.
 
 Código sob a licença MIT. Veja [LICENSE](LICENSE).
 
+O Stockfish.js, baixado via npm, é distribuído sob a licença GPL-3.0.
+
 ---
 
 ## English summary
