@@ -13,8 +13,8 @@ jogada com Stockfish, exibida em um overlay sempre no topo.
    imagens de `referencias/`.
 4. Trata elementos de interface que se sobrepõem às peças (selo `?!` e ícone
    de livro de abertura).
-5. Valida a posição lida, detecta o turno pelo diff entre leituras e descarta
-   leituras implausíveis (por exemplo, uma peça que desaparece sem destino).
+5. Confirma a posição em duas leituras. Identifica a vez pelo destaque do último
+   lance ou pelas regras da posição e acompanha os lances legais a partir daí.
 6. Consulta o Stockfish via `stockfish_helper.js` e mostra a jogada no overlay.
 
 ## Requisitos
@@ -45,7 +45,8 @@ O `npm install` baixa o Stockfish.js (WASM), que ocupa cerca de 196 MB em
 
 ## Uso
 
-1. Abra o chess.com no Chrome e inicie uma partida contra um bot.
+1. Abra uma partida contra um bot no chess.com pelo Chrome. Você pode iniciar
+   o assistente com a partida já em andamento.
 2. Confira que o tabuleiro está visível e com as suas peças embaixo.
 3. Execute:
 
@@ -53,9 +54,19 @@ O `npm install` baixa o Stockfish.js (WASM), que ocupa cerca de 196 MB em
 python assistente_automatico.py
 ```
 
-O overlay mostra a jogada sugerida e o status da leitura. Pressione `Ctrl+C`
-no terminal para encerrar. O programa também encerra sozinho ao detectar o fim
-da partida.
+Se a vez estiver indefinida, o assistente aguarda um lance visível antes de
+mostrar uma sugestão. Mantenha o destaque do último lance e as coordenadas
+visíveis. Se as coordenadas estiverem ocultas e a orientação for lida errada,
+passe `--orientacao brancas` ou `--orientacao pretas`, conforme a cor embaixo.
+
+Pressione `Ctrl+C` no terminal para encerrar. O programa também encerra sozinho
+quando confirma um fim de partida detectável pela posição ou pelos lances
+acompanhados.
+
+Na sua vez, a casa de origem fica azul com uma borda e a de destino fica âmbar
+com duas bordas. As marcações são translúcidas e os cliques passam para o
+tabuleiro normalmente. O painel mostra as duas coordenadas nas mesmas cores,
+a peça sugerida e o estado da leitura.
 
 Ajustes comuns ficam no topo de `assistente_automatico.py`:
 
@@ -83,6 +94,8 @@ python depurar_deteccao.py --imagem caminho/para/imagem.png
 
 ```text
 assistente_automatico.py  Entrada principal e overlay
+painel.py                 Painel de estado e sugestão de lance
+destaques.py              Marcações sobre as casas no Windows
 deteccao.py               Visão computacional e reconhecimento das peças
 stockfish_helper.js       Ponte entre o Python e o Stockfish (Node.js)
 depurar_deteccao.py       Suíte de regressão e depuração
@@ -95,7 +108,10 @@ fixtures/                 Imagens usadas nos testes
 - O reconhecimento depende do tema padrão do chess.com. Para outro tema, as
   imagens em `referencias/` precisam ser recapturadas.
 - O tabuleiro precisa estar totalmente visível e sem sobreposição de janelas.
-- A inferência de turno assume que o jogador está sempre com as peças embaixo.
+- A sugestão é mostrada quando for a vez da cor que está embaixo.
+- Ao começar no meio da partida, o histórico anterior e os direitos de roque
+  podem ser desconhecidos. Os direitos passam a ser acompanhados quando a
+  leitura começa na posição inicial.
 
 ## Aviso
 

@@ -4,7 +4,7 @@ ASSISTENTE DE XADREZ - 100% AUTOMÁTICO
 1. Foca o Chrome já aberto
 2. Detecta o tabuleiro na tela automaticamente
 3. Reconhece as peças por template matching invariante ao fundo
-4. Rastreia o turno pelo diff entre posições
+4. Identifica o turno pelo destaque do último lance e acompanha lances legais
 5. Calcula a melhor jogada com Stockfish (helper Node.js)
 6. Mostra a jogada em um overlay sempre no topo
 7. Repete até a partida acabar
@@ -18,6 +18,7 @@ Requisitos:
     - Imagens de referência na pasta 'referencias/'
 """
 
+import argparse
 import io
 import os
 import queue
@@ -26,6 +27,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 
 import chess
 import cv2
@@ -34,6 +36,8 @@ import numpy as np
 import pygetwindow as gw
 
 import deteccao
+from destaques import Destaques
+from painel import Painel
 
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -44,12 +48,12 @@ TEMPO_STOCKFISH_MS = 1500
 TIMEOUT_STOCKFISH = 8.0
 LIMIAR_TEMPLATE = 0.40
 CONFIRMACOES_FIM = 5
-MIN_PECAS_LEITURA = 6
-MIN_PECAS_FIM = 3
+MIN_PECAS_LEITURA = 2
 TEMPO_RESINCRONIZACAO = 6.0
 MODO_DEBUG = False
-NOME_HELPER = "stockfish_helper.js"
-ARQUIVO_LOG = "debug_sessao.log"
+PASTA_PROJETO = Path(__file__).resolve().parent
+NOME_HELPER = PASTA_PROJETO / "stockfish_helper.js"
+ARQUIVO_LOG = PASTA_PROJETO / "debug_sessao.log"
 
 
 def _abrir_mss():
@@ -57,13 +61,10 @@ def _abrir_mss():
 
 
 class AssistenteXadrez:
-    def __init__(self):
-        print("=" * 60)
-        print("  ASSISTENTE DE XADREZ - 100% AUTOMÁTICO")
-        print("=" * 60)
-        print()
-
-        print("🔧 Inicializando Stockfish (via Node.js)...")
+    def __init__(self, orientacao=None):
+        print("Assistente de Xadrez")
+        print("Abra uma partida contra um bot no Chrome. Ctrl+C encerra o assistente.\n")
+        print("Stockfish  | Iniciando motor")
         self.engine_proc = None
         self._fila_respostas = queue.Queue()
         self._req_id = 0
@@ -72,11 +73,12 @@ class AssistenteXadrez:
         self._jogada_cache_desc = None
         self._iniciar_engine()
 
-        print("🔧 Carregando referências das peças...")
-        self.referencias = deteccao.carregar_referencias()
+        print("Leitura    | Carregando referências das peças")
+        self.referencias = deteccao.carregar_referencias(PASTA_PROJETO / "referencias")
 
+        self._orientacao_manual = orientacao
         self.cor_jogador = None
-        self.turno = chess.WHITE
+        self.board = None
         self.pecas_estaveis = None
         self._pecas_pendentes = None
         self.jogada_anterior = None
@@ -95,21 +97,9 @@ class AssistenteXadrez:
         self._instavel_desde = None
 
         self.overlay = None
-        self.lbl_titulo = None
-        self.lbl_jogada = None
-        self.lbl_status = None
+        self.destaques = None
+        self._origem_monitor = (0, 0)
         self._criar_overlay()
-
-        print()
-        print("📋 INSTRUÇÕES:")
-        print("   1. Deixe o Chrome aberto com o chess.com")
-        print("   2. Inicie uma partida contra bots")
-        print("   3. O programa detecta tudo automaticamente")
-        print("   4. Sua cor = peças na parte de baixo da tela")
-        print("   5. Pressione Ctrl+C para parar a qualquer momento")
-        print()
-        print("⚠️  Não minimize o Chrome enquanto o programa roda!")
-        print()
 
     # -----------------------------------------------------------------------
     # STOCKFISH (helper Node.js)
@@ -121,7 +111,7 @@ class AssistenteXadrez:
             ambiente["SF_DEPTH"] = str(PROFUNDIDADE_STOCKFISH)
             ambiente["SF_MOVETIME"] = str(TEMPO_STOCKFISH_MS)
             self.engine_proc = subprocess.Popen(
-                ["node", NOME_HELPER],
+                ["node", str(NOME_HELPER)],
                 env=ambiente,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -139,10 +129,10 @@ class AssistenteXadrez:
             self._jogada_cache_desc = None
             time.sleep(0.4)
             if anunciar:
-                print("   ✅ Stockfish carregado (Node.js helper)")
+                print("Stockfish  | Motor carregado")
             return True
         except Exception as erro:
-            print(f"   ❌ Erro ao iniciar Stockfish: {erro}")
+            print(f"Stockfish  | Erro ao iniciar: {erro}")
             self.engine_proc = None
             return False
 
@@ -202,7 +192,7 @@ class AssistenteXadrez:
             processo.stdin.write(f"{requisicao}|{fen}\n")
             processo.stdin.flush()
         except Exception as erro:
-            print(f"   ⚠️  Falha ao enviar posição ao Stockfish: {erro}")
+            print(f"Stockfish  | Falha ao enviar posição: {erro}")
             self._iniciar_engine(anunciar=False)
             return None, None
 
@@ -222,11 +212,15 @@ class AssistenteXadrez:
             break
 
         if jogada is None:
-            print("   ⚠️  Stockfish demorou muito; reiniciando motor...")
+            print("Stockfish  | Tempo esgotado. Reiniciando motor.")
             self._iniciar_engine(anunciar=False)
             return None, None
 
-        if jogada in ("none", "(none)"):
+        try:
+            board.parse_uci(jogada)
+        except ValueError:
+            return None, None
+        if jogada == "0000":
             return None, None
 
         descricao = self._uci_para_humano(jogada, board)
@@ -266,44 +260,21 @@ class AssistenteXadrez:
     # -----------------------------------------------------------------------
     def _criar_overlay(self):
         try:
-            self.overlay = tk.Tk()
-            self.overlay.attributes("-topmost", True)
-            self.overlay.overrideredirect(True)
-            self.overlay.configure(bg="#1a1a2e")
-            self.overlay.geometry("350x130+100+100")
-
-            self.lbl_titulo = tk.Label(
-                self.overlay,
-                text="♟️ MELHOR JOGADA",
-                font=("Arial", 13, "bold"),
-                bg="#1a1a2e",
-                fg="#e94560",
-            )
-            self.lbl_titulo.pack(pady=(8, 4))
-
-            self.lbl_jogada = tk.Label(
-                self.overlay,
-                text="Aguardando...",
-                font=("Arial", 18, "bold"),
-                bg="#1a1a2e",
-                fg="#4cc9f0",
-            )
-            self.lbl_jogada.pack(pady=(0, 6))
-
-            self.lbl_status = tk.Label(
-                self.overlay,
-                text="● Ativo",
-                font=("Arial", 10),
-                bg="#1a1a2e",
-                fg="#4ade80",
-            )
-            self.lbl_status.pack()
-
+            # A captura e as janelas precisam usar os mesmos pixels físicos.
+            with _abrir_mss():
+                pass
+            self.overlay = Painel()
             self.overlay.update_idletasks()
             self.overlay.update()
         except Exception as erro:
-            print(f"   ⚠️  Não foi possível criar overlay: {erro}")
+            print(f"Painel     | Falha ao abrir: {erro}")
             self.overlay = None
+            return
+
+        try:
+            self.destaques = Destaques(self.overlay)
+        except OSError as erro:
+            print(f"Marcações  | Falha ao preparar: {erro}")
 
     def _posicionar_overlay(self):
         if self.overlay is None:
@@ -313,34 +284,57 @@ class AssistenteXadrez:
                 if not (0 < self.monitor_indice < len(sct.monitors)):
                     return
                 monitor = sct.monitors[self.monitor_indice]
-            largura = 350
-            x = monitor["left"] + monitor["width"] - largura - 20
-            y = monitor["top"] + 20
-            self.overlay.geometry(f"{largura}x130+{x}+{y}")
+            largura, altura = self.overlay.largura, self.overlay.altura
+            esquerda, topo = monitor["left"], monitor["top"]
+            direita, baixo = esquerda + monitor["width"], topo + monitor["height"]
+            x, y = direita - largura - 20, topo + 20
+            if self.coords_tabuleiro is not None:
+                bx, by, bw, bh = self.coords_tabuleiro
+                bx, by = esquerda + bx, topo + by
+                cantos = (
+                    (x, y), (esquerda + 20, y),
+                    (x, baixo - altura - 20), (esquerda + 20, baixo - altura - 20),
+                )
+                x, y = min(cantos, key=lambda canto: (
+                    max(0, min(canto[0] + largura, bx + bw) - max(canto[0], bx))
+                    * max(0, min(canto[1] + altura, by + bh) - max(canto[1], by))
+                ))
+            self.overlay.geometry(f"{largura}x{altura}+{x}+{y}")
             self.overlay.update()
         except Exception:
             pass
 
-    def atualizar_overlay(self, jogada_texto, uci=""):
-        if self.overlay is None or self.lbl_jogada is None:
-            return
-        try:
-            self.lbl_jogada.config(text=jogada_texto)
-            if uci and self.lbl_titulo is not None:
-                self.lbl_titulo.config(text=f"♟️ {uci}")
-            self.overlay.update()
-        except Exception:
-            pass
+    def _exibir_espera(self, mensagem, detalhe="", estado="Em espera"):
+        if self.destaques is not None:
+            self.destaques.ocultar()
+        if self.overlay is not None:
+            self.overlay.espera(mensagem, detalhe, estado)
 
-    def ocultar_overlay(self):
-        if self.overlay is None:
+    def _exibir_jogada(self, board, uci):
+        if self.overlay is not None:
+            peca = board.piece_at(chess.parse_square(uci[:2]))
+            detalhe = deteccao.SIMBOLOS[peca.symbol()]
+            if len(uci) > 4:
+                detalhe = f"Promoção a {deteccao.SIMBOLOS[uci[4]].lower()}"
+            self.overlay.jogada(uci[:2], uci[2:4], detalhe)
+        self._mostrar_destaques(uci)
+
+    def _mostrar_destaques(self, uci):
+        if self.destaques is None or self.coords_tabuleiro is None or self._grade is None:
             return
         try:
-            if self.lbl_jogada is not None:
-                self.lbl_jogada.config(text="Aguardando oponente...")
-            self.overlay.update()
-        except Exception:
-            pass
+            janela_chrome = self._janela_chrome()
+            if janela_chrome is None or gw.getActiveWindow() != janela_chrome:
+                self.destaques.ocultar()
+                return
+            self.destaques.mostrar(
+                chess.Move.from_uci(uci), self.cor_jogador, self.coords_tabuleiro,
+                self._grade, self._origem_monitor,
+            )
+        except (OSError, tk.TclError) as erro:
+            self.destaques.ocultar()
+            self.destaques = None
+            print(f"Marcações  | Falha ao exibir: {erro}")
 
     def _atualizar_tk(self):
         if self.overlay is not None:
@@ -362,14 +356,20 @@ class AssistenteXadrez:
             ]
             if not janelas:
                 return None
-            return max(janelas, key=lambda janela: janela.width * janela.height)
+            return max(
+                janelas,
+                key=lambda janela: (
+                    "chess.com" in janela.title.lower(),
+                    janela.width * janela.height,
+                ),
+            )
         except Exception:
             return None
 
     def focar_chrome(self):
         janela = self._janela_chrome()
         if janela is None:
-            print("   ⚠️  Chrome não encontrado!")
+            print("Chrome     | Janela ainda não encontrada")
             return False
         try:
             if janela.isMinimized:
@@ -378,7 +378,7 @@ class AssistenteXadrez:
             time.sleep(1.0)
             return True
         except Exception as erro:
-            print(f"   ⚠️  Erro ao focar Chrome: {erro}")
+            print(f"Chrome     | Falha ao trazer a janela para frente: {erro}")
             return False
 
     def _detectar_monitor_chrome(self):
@@ -402,24 +402,26 @@ class AssistenteXadrez:
         return 1
 
     def capturar_tela(self):
+        if self.destaques is not None:
+            self.destaques.preparar_captura()
         with _abrir_mss() as sct:
             monitores = sct.monitors
             indice = self.monitor_indice if 0 < self.monitor_indice < len(monitores) else 1
-            imagem = np.array(sct.grab(monitores[indice]))
+            monitor = monitores[indice]
+            self._origem_monitor = (monitor["left"], monitor["top"])
+            imagem = np.array(sct.grab(monitor))
             return cv2.cvtColor(imagem, cv2.COLOR_BGRA2BGR)
 
     # -----------------------------------------------------------------------
     # LOOP PRINCIPAL
     # -----------------------------------------------------------------------
     def executar(self):
-        print("🚀 Iniciando assistente automático...")
-        print()
         if not self.focar_chrome():
-            print("   ⚠️  Mantenha o Chrome visível na tela.")
+            print("Chrome     | Mantenha o tabuleiro visível")
         self.monitor_indice = self._detectar_monitor_chrome()
         self._posicionar_overlay()
         self._registrar_log(f"--- sessão iniciada | monitor={self.monitor_indice} ---")
-        print("🔍 Procurando tabuleiro na tela...\n")
+        print("\nTabuleiro  | Procurando no Chrome")
 
         try:
             while self.partida_ativa:
@@ -430,20 +432,26 @@ class AssistenteXadrez:
                     if coords is not None and deteccao.verificar_tabuleiro_valido(imagem_tela, coords):
                         self.coords_tabuleiro = coords
                         self._marcar_leitura_estavel()
+                        self._posicionar_overlay()
                         left, top, largura, altura = coords
-                        print(f"   ✅ Tabuleiro encontrado: ({left}, {top}) {largura}x{altura}")
+                        print(f"Tabuleiro  | Encontrado em ({left}, {top}) · {largura} × {altura} px")
                     else:
-                        self._status("   ⏳ Aguardando tabuleiro aparecer na tela...")
+                        self._exibir_espera("Aguardando tabuleiro", "Abra o tabuleiro no Chrome")
+                        self._status("Tabuleiro  | Aguardando tabuleiro visível")
                         self._dormir()
                         continue
                 else:
                     if not deteccao.verificar_tabuleiro_valido(imagem_tela, self.coords_tabuleiro):
                         self._falhas_tabuleiro += 1
                         if self._falhas_tabuleiro >= 3:
-                            print("   ⚠️  Tabuleiro não está mais visível. Procurando novamente...")
+                            print("Tabuleiro  | Saiu da tela. Procurando novamente.")
                             self.coords_tabuleiro = None
                             self._falhas_tabuleiro = 0
                             self._resetar_posicao()
+                            self.cor_jogador = None
+                            self.monitor_indice = self._detectar_monitor_chrome()
+                            self._posicionar_overlay()
+                        self._exibir_espera("Aguardando tabuleiro", "Mantenha o tabuleiro visível")
                         self._dormir()
                         continue
                     self._falhas_tabuleiro = 0
@@ -452,6 +460,7 @@ class AssistenteXadrez:
                 regiao = imagem_tela[top:top + altura, left:left + largura]
                 if regiao.size == 0:
                     self.coords_tabuleiro = None
+                    self._exibir_espera("Aguardando tabuleiro", "Mantenha o tabuleiro visível")
                     self._dormir()
                     continue
 
@@ -459,13 +468,13 @@ class AssistenteXadrez:
                     self._grade = deteccao.calibrar_grade(regiao)
                     self._grade_coords = self.coords_tabuleiro
                     print(
-                        f"   📐 Grade calibrada: casa={self._grade.tamanho:.2f}px "
+                        f"Leitura    | Grade calibrada: casa={self._grade.tamanho:.2f}px "
                         f"origem=({self._grade.origem_x:.1f}, {self._grade.origem_y:.1f}) "
                         f"score={self._grade.pontuacao:.3f}"
                     )
                     if self._grade.pontuacao < 0.90:
                         print(
-                            "   ⚠️  Calibração fraca: confira se o tabuleiro "
+                            "Leitura    | Calibração fraca. Confira se o tabuleiro "
                             "está inteiro na tela."
                         )
 
@@ -473,30 +482,32 @@ class AssistenteXadrez:
                     regiao, self.referencias, LIMIAR_TEMPLATE, self._grade
                 )
                 if len(grade) < MIN_PECAS_LEITURA:
+                    self._pecas_pendentes = None
                     self._marcar_leitura_instavel()
                     self._poucas_pecas += 1
                     if self._poucas_pecas >= 3:
                         self._grade = None
                         self._poucas_pecas = 0
-                    self._status("   ⏳ Poucas peças detectadas. Aguardando...")
+                    self._status("Leitura    | Poucas peças detectadas")
+                    self._exibir_espera("Relendo posição", "Poucas peças detectadas", "Leitura")
                     self._dormir()
                     continue
                 self._poucas_pecas = 0
 
-                if self.cor_jogador is None:
-                    self.cor_jogador = deteccao.detectar_cor_jogador(grade)
-                    if self.cor_jogador is None:
-                        self._status("   ⏳ Não foi possível detectar sua cor. Aguardando...")
-                        self._dormir()
-                        continue
-                    nome_cor = "Brancas" if self.cor_jogador == chess.WHITE else "Pretas"
-                    print(f"   ✅ Sua cor detectada: {nome_cor} (peças na parte de baixo)\n")
-
-                pecas = deteccao.mapear_pecas(grade, self.cor_jogador)
+                orientacao = self._orientacao_manual
+                if orientacao is None:
+                    orientacao = deteccao.detectar_orientacao(regiao, self._grade)
+                if orientacao is None:
+                    orientacao = self.cor_jogador
+                if orientacao is None:
+                    orientacao = deteccao.detectar_cor_jogador(grade)
+                pecas = deteccao.mapear_pecas(grade, orientacao)
 
                 valido, motivo = deteccao.validar_posicao(pecas)
                 if not valido:
+                    self._pecas_pendentes = None
                     self._marcar_leitura_instavel()
+                    self._exibir_espera("Relendo posição", motivo.capitalize(), "Leitura")
                     chave_diag = tuple(sorted(pecas.items()))
                     agora = time.monotonic()
                     if (
@@ -512,66 +523,52 @@ class AssistenteXadrez:
                         )
                         self._grade = None
                     self._status(
-                        f"   ⚠️  Posição inconsistente ({motivo}). Aguardando..."
+                        f"Leitura    | Posição inconsistente ({motivo})"
                     )
                     self._dormir()
                     continue
                 self._ultimo_diag = None
 
-                mudou = False
-                if self.pecas_estaveis is None:
-                    self.pecas_estaveis = dict(pecas)
-                    self.turno = self._turno_inicial(pecas)
-                    mudou = True
-                elif pecas == self.pecas_estaveis:
-                    self._pecas_pendentes = None
-                elif pecas == self._pecas_pendentes:
-                    if not deteccao.transicao_plausivel(self.pecas_estaveis, pecas):
-                        self._marcar_leitura_instavel()
-                        self._pecas_pendentes = None
-                        self._registrar_log(
-                            f"leitura descartada: nenhuma peça nova | {len(pecas)} peças"
-                        )
-                        self._status(
-                            "   ⚠️  Peça sumiu sem lance correspondente. Relendo..."
-                        )
-                        self._dormir()
-                        continue
-                    lado = deteccao.inferir_lado_movido(self.pecas_estaveis, pecas)
-                    self.pecas_estaveis = dict(pecas)
-                    self._pecas_pendentes = None
-                    if lado is not None:
-                        self.turno = not lado
-                    else:
-                        self.turno = not self.turno
-                        self._registrar_log(
-                            "lado do lance indefinido; assumindo que quem estava "
-                            "para jogar fez o lance"
-                        )
-                    mudou = True
-                else:
+                if orientacao != self.cor_jogador:
+                    self._resetar_posicao()
+                    self.cor_jogador = orientacao
+                    nome_cor = "Brancas" if orientacao == chess.WHITE else "Pretas"
+                    print(f"Tabuleiro  | {nome_cor} embaixo")
+
+                nova_posicao = pecas != self.pecas_estaveis
+                if nova_posicao and pecas != self._pecas_pendentes:
                     self._marcar_leitura_instavel()
-                    self._pecas_pendentes = dict(pecas)
-                    self._status("   ⏳ Confirmando nova posição...")
+                    self._pecas_pendentes = pecas
+                    self._exibir_espera("Confirmando posição", estado="Leitura")
+                    self._status("Leitura    | Confirmando posição")
                     self._dormir()
                     continue
 
-                board = deteccao.montar_board(pecas, self.turno)
-                if not board.is_valid():
-                    board_alternativo = deteccao.montar_board(pecas, not self.turno)
-                    if board_alternativo.is_valid():
-                        self.turno = not self.turno
-                        board = board_alternativo
-                    else:
+                board_anterior = self.board
+                if nova_posicao or self.board is None:
+                    destaques = deteccao.detectar_lances_destacados(
+                        regiao, self._grade, grade, orientacao
+                    )
+                    if not self._confirmar_posicao(pecas, destaques):
                         self._marcar_leitura_instavel()
-                        self._status("   ⚠️  Posição inválida detectada. Aguardando...")
+                        self._exibir_espera("Relendo posição", "Lance ainda não identificado", "Leitura")
+                        self._status("Leitura    | Lance ainda não identificado")
                         self._dormir()
                         continue
+                self._pecas_pendentes = None
                 self._marcar_leitura_estavel()
 
+                board = self.board
+                if board is None:
+                    self._status("Leitura    | Vez indefinida. Aguardando um lance visível.")
+                    self._exibir_espera("Aguardando um lance", "Vez ainda indefinida")
+                    self._dormir()
+                    continue
+                mudou = board is not board_anterior
                 if mudou:
-                    vez = "Brancas" if self.turno == chess.WHITE else "Pretas"
-                    print(f"   📍 {len(pecas)} peças | Vez: {vez}")
+                    self.contador_partida_encerrada = 0
+                    vez = "Brancas" if board.turn == chess.WHITE else "Pretas"
+                    print(f"Posição    | {len(pecas)} peças · Vez das {vez.lower()}")
                     self._registrar_log(
                         f"posição confirmada: {len(pecas)} peças | vez={vez} | "
                         f"{board.fen()}"
@@ -582,46 +579,47 @@ class AssistenteXadrez:
                         )
                         print(f"      {lista}")
 
-                if len(pecas) >= MIN_PECAS_FIM and board.is_game_over():
+                if board.is_game_over():
+                    self._exibir_espera("Fim de partida", estado="Encerrada")
                     self.contador_partida_encerrada += 1
                     if self.contador_partida_encerrada >= CONFIRMACOES_FIM:
                         self._imprimir_fim(board)
                         break
                     self._status(
-                        f"   ⚠️  Possível fim de partida "
+                        f"Posição    | Confirmando fim de partida "
                         f"({self.contador_partida_encerrada}/{CONFIRMACOES_FIM})..."
                     )
                     self._dormir()
                     continue
                 self.contador_partida_encerrada = 0
 
-                if self.turno == self.cor_jogador:
+                if board.turn == self.cor_jogador:
                     if mudou:
-                        print("   🤔 Calculando melhor jogada...")
+                        self._exibir_espera("Calculando jogada", estado="Stockfish")
+                        self._atualizar_tk()
+                        print("Stockfish  | Calculando jogada")
                     jogada_uci, descricao = self.calcular_melhor_jogada(board)
                     if jogada_uci and descricao:
                         if descricao != self.jogada_anterior:
-                            print("\n" + "🎯" * 35)
-                            print(f"   ➡️  MELHOR JOGADA: {descricao}")
-                            print(f"   📐 UCI: {jogada_uci}")
-                            print("🎯" * 35 + "\n")
+                            print(f"Sugestão   | {descricao}  [{jogada_uci}]")
                             self.jogada_anterior = descricao
                             self._registrar_log(
                                 f"jogada sugerida: {jogada_uci} | {descricao}"
                             )
-                        self.atualizar_overlay(descricao, jogada_uci)
+                        self._exibir_jogada(board, jogada_uci)
                     else:
-                        self._status("   ⚠️  Stockfish não retornou jogada.")
+                        self._status("Stockfish  | Nenhuma jogada recebida")
+                        self._exibir_espera("Aguardando Stockfish", estado="Motor")
                 else:
-                    self._status("   ⏸️  Aguardando jogada do oponente...")
-                    self.ocultar_overlay()
+                    self._status("Posição    | Aguardando oponente")
+                    self._exibir_espera("Aguardando oponente", estado="Vez do oponente")
 
                 self._dormir()
 
         except KeyboardInterrupt:
-            print("\n\n👋 Programa interrompido pelo usuário.")
+            print("\nSessão     | Interrompida pelo usuário")
         except Exception as erro:
-            print(f"\n❌ Erro inesperado: {erro}")
+            print(f"\nSessão     | Erro inesperado: {erro}")
             import traceback
             traceback.print_exc()
         finally:
@@ -631,18 +629,42 @@ class AssistenteXadrez:
                     self.overlay.destroy()
                 except Exception:
                     pass
-            print("👋 Assistente encerrado.")
+            print("Sessão     | Encerrada")
 
-    def _turno_inicial(self, pecas):
-        if pecas == deteccao.POSICAO_INICIAL:
-            return chess.WHITE
-        if self.cor_jogador is not None:
-            return self.cor_jogador
-        return chess.WHITE
+    def _confirmar_posicao(self, pecas, lances_destacados):
+        candidatos = deteccao.tabuleiros_possiveis(pecas)
+        if not candidatos:
+            return False
+
+        houve_transicao = self.pecas_estaveis is not None and pecas != self.pecas_estaveis
+        board = None
+        if houve_transicao:
+            anteriores = (
+                [self.board] if self.board is not None
+                else deteccao.tabuleiros_possiveis(self.pecas_estaveis)
+            )
+            board = deteccao.avancar_posicao(anteriores, candidatos[0])
+            if board is None and not deteccao.transicao_plausivel(self.pecas_estaveis, pecas):
+                return False
+
+        if board is None:
+            board = deteccao.sincronizar_pelo_destaque(candidatos, lances_destacados)
+            if board is None and houve_transicao:
+                # Após uma leitura conhecida, um salto sem destaque confiável
+                # só pode virar a nova base depois da ressincronização.
+                return False
+            if board is None and len(candidatos) == 1:
+                board = candidatos[0]
+
+        self.board = board
+        self.pecas_estaveis = pecas
+        return True
 
     def _resetar_posicao(self):
+        self.board = None
         self.pecas_estaveis = None
         self._pecas_pendentes = None
+        self.jogada_anterior = None
         self.contador_partida_encerrada = 0
 
     def _registrar_log(self, mensagem):
@@ -663,7 +685,7 @@ class AssistenteXadrez:
         if agora - self._instavel_desde < TEMPO_RESINCRONIZACAO:
             return
         self._instavel_desde = None
-        print("   🔄 Leituras instáveis por muito tempo; ressincronizando posição...")
+        print("Leitura    | Ressincronizando posição")
         self._registrar_log("ressincronização automática após leituras instáveis")
         self._resetar_posicao()
         self._grade = None
@@ -671,23 +693,19 @@ class AssistenteXadrez:
         self._poucas_pecas = 0
 
     def _imprimir_fim(self, board):
-        print("\n" + "=" * 60)
-        print("  🏁 PARTIDA ENCERRADA!")
-        print("=" * 60)
         if board.is_checkmate():
             vencedor = "Pretas" if board.turn == chess.WHITE else "Brancas"
-            print(f"   Xeque-mate! Vencedor: {vencedor}")
+            print(f"Partida    | Xeque-mate · Vitória das {vencedor.lower()}")
         elif board.is_stalemate():
-            print("   Empate por afogamento!")
+            print("Partida    | Empate por afogamento")
         elif board.is_insufficient_material():
-            print("   Empate por material insuficiente!")
+            print("Partida    | Empate por material insuficiente")
         elif board.is_seventyfive_moves():
-            print("   Empate pela regra dos 75 lances!")
+            print("Partida    | Empate pela regra dos 75 lances")
         elif board.is_fivefold_repetition():
-            print("   Empate por repetição quíntupla!")
+            print("Partida    | Empate por repetição quíntupla")
         else:
-            print("   Partida encerrada.")
-        print("=" * 60)
+            print("Partida    | Encerrada")
 
     def _salvar_diagnostico(self, regiao, grade, confiancas, motivo):
         nome = time.strftime("debug_leitura_%Y%m%d_%H%M%S.png")
@@ -707,7 +725,7 @@ class AssistenteXadrez:
                 imagem, simbolo, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2
             )
         cv2.imwrite(nome, imagem)
-        print(f"   🖼️  Diagnóstico salvo: {nome} ({motivo})")
+        print(f"Leitura    | Diagnóstico salvo: {nome} ({motivo})")
         baixas = sorted(
             ((linha, coluna), round(valor, 2))
             for (linha, coluna), valor in confiancas.items()
@@ -727,5 +745,12 @@ class AssistenteXadrez:
 
 
 if __name__ == "__main__":
-    assistente = AssistenteXadrez()
+    parser = argparse.ArgumentParser(description="Analisa o tabuleiro de xadrez visível no Chrome.")
+    parser.add_argument(
+        "--orientacao", choices=("brancas", "pretas"),
+        help="cor das peças na parte de baixo, caso as coordenadas estejam ocultas",
+    )
+    opcoes = parser.parse_args()
+    orientacao = {"brancas": chess.WHITE, "pretas": chess.BLACK}.get(opcoes.orientacao)
+    assistente = AssistenteXadrez(orientacao)
     assistente.executar()

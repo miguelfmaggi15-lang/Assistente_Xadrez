@@ -36,10 +36,13 @@ PASTA_REFERENCIAS = "referencias"
 IMAGEM_REGRESSAO = "fixtures/print_tabuleiro.png"
 CAPTURAS_REAIS = {
     "fixtures/debug_leitura_20261019_203008.png": (
-        "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R"
+        "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R", ("g1", "f3"), chess.BLACK
     ),
     "fixtures/debug_leitura_20261019_203147.png": (
-        "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R"
+        "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R", ("g1", "f3"), chess.BLACK
+    ),
+    "fixtures/rei_em_g1_com_casa_selecionada.png": (
+        "r1b4Q/ppppk3/2n1p1p1/6p1/3P4/2P1qP2/P1P2RPP/R5K1", ("b8", "c6"), chess.WHITE
     ),
 }
 
@@ -67,19 +70,22 @@ def carregar_recortes_crus(pasta=PASTA_REFERENCIAS):
     return recortes
 
 
-def montar_tabuleiro_sintetico(recortes, cor_jogador):
+def montar_tabuleiro_sintetico(recortes, cor_jogador, board=None, destaque=()):
     lado = 8 * TAMANHO_TESTE
     tabuleiro = np.zeros((lado, lado, 3), np.uint8)
 
     for linha in range(8):
         for coluna in range(8):
             cor = COR_CLARA if (linha + coluna) % 2 == 0 else COR_ESCURA
+            if deteccao.casa_de(linha, coluna, cor_jogador) in destaque:
+                cor = (105, 247, 247) if (linha + coluna) % 2 == 0 else (43, 203, 187)
             tabuleiro[
                 linha * TAMANHO_TESTE:(linha + 1) * TAMANHO_TESTE,
                 coluna * TAMANHO_TESTE:(coluna + 1) * TAMANHO_TESTE,
             ] = cor
 
-    board = chess.Board()
+    if board is None:
+        board = chess.Board()
     for casa in chess.SQUARES:
         peca = board.piece_at(casa)
         if peca is None:
@@ -161,7 +167,7 @@ def executar_regressoes_reais(referencias):
     """Capturas reais da sessão que antes travavam a leitura."""
     encontrados = 0
     tudo_ok = True
-    for nome, fen_esperado in CAPTURAS_REAIS.items():
+    for nome, (fen_esperado, lance_esperado, vez_esperada) in CAPTURAS_REAIS.items():
         if not os.path.exists(nome):
             continue
         encontrados += 1
@@ -177,10 +183,21 @@ def executar_regressoes_reais(referencias):
         pecas = deteccao.mapear_pecas(grade, chess.WHITE)
         valido, motivo = deteccao.validar_posicao(pecas)
         fen = deteccao.montar_board(pecas, chess.WHITE).fen().split(" ")[0]
-        ok = valido and len(grade) == 32 and fen == fen_esperado
+        orientacao = deteccao.detectar_orientacao(imagem, grade_calibrada)
+        destaques = deteccao.detectar_lances_destacados(
+            imagem, grade_calibrada, grade, chess.WHITE
+        )
+        board = deteccao.sincronizar_pelo_destaque(
+            deteccao.tabuleiros_possiveis(pecas), destaques
+        )
+        ok = (
+            valido and fen == fen_esperado and orientacao == chess.WHITE
+            and lance_esperado in destaques and board is not None and board.turn == vez_esperada
+        )
         tudo_ok = tudo_ok and ok
         print(
             f"{'✅' if ok else '❌'} {nome}: peças={len(grade)} FEN={fen}"
+            f" | orientação={orientacao} | destaques={destaques}"
             + ("" if valido else f" | inválido: {motivo}")
         )
     if encontrados == 0:
@@ -339,6 +356,33 @@ def _teste_transicao_plausivel():
     return tudo_ok
 
 
+def _teste_abrir_em_final(referencias, recortes):
+    board = chess.Board("8/3p4/8/2P5/8/3k4/8/3K4 b - - 0 1")
+    board.push_uci("d7d5")
+    depois = board.copy()
+    depois.push_uci("c5d6")
+    tudo_ok = True
+    for cor in (chess.WHITE, chess.BLACK):
+        imagem = montar_tabuleiro_sintetico(recortes, cor, board, ("d7", "d5"))
+        calibracao = deteccao.calibrar_grade(imagem)
+        grade, _ = deteccao.detectar_pecas(imagem, referencias, LIMIAR, calibracao)
+        destaques = deteccao.detectar_lances_destacados(imagem, calibracao, grade, cor)
+        pecas = deteccao.mapear_pecas(grade, cor)
+        candidatos = deteccao.tabuleiros_possiveis(pecas)
+        atual = deteccao.sincronizar_pelo_destaque(candidatos, destaques)
+        avancado = deteccao.avancar_posicao([atual], depois) if atual else None
+        ok = (
+            len(grade) == 4 and len(candidatos) == 2 and destaques == [("d7", "d5")]
+            and atual is not None and atual.board_fen() == board.board_fen()
+            and atual.turn == chess.WHITE and atual.has_legal_en_passant()
+            and avancado is not None and avancado.turn == chess.BLACK
+            and avancado.board_fen() == depois.board_fen()
+        )
+        print(f"{'✅' if ok else '❌'} Final com 4 peças e en passant | brancas embaixo={cor}")
+        tudo_ok = tudo_ok and ok
+    return tudo_ok
+
+
 def executar_teste(referencias):
     if not referencias:
         print("❌ Nenhuma referência carregada. Coloque as imagens em 'referencias/'.")
@@ -407,6 +451,10 @@ def executar_teste(referencias):
 
     print("--- Regressão: transições de posição ---")
     if not _teste_transicao_plausivel():
+        tudo_ok = False
+
+    print("--- Regressão: abrir com a partida em andamento ---")
+    if not _teste_abrir_em_final(referencias, recortes):
         tudo_ok = False
 
     print("--- Regressões com capturas reais ---")

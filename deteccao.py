@@ -73,6 +73,92 @@ class Grade(NamedTuple):
     pontuacao: float
 
 
+def _recortar_casa(imagem, grade, linha, coluna, x1, y1, x2, y2):
+    altura, largura = imagem.shape[:2]
+    tamanho = grade.tamanho
+    x = grade.origem_x + coluna * tamanho
+    y = grade.origem_y + linha * tamanho
+    return imagem[
+        max(0, round(y + y1 * tamanho)):min(altura, round(y + y2 * tamanho)),
+        max(0, round(x + x1 * tamanho)):min(largura, round(x + x2 * tamanho)),
+    ]
+
+
+def _ler_numero_fileira(imagem, grade, linha):
+    recorte = _recortar_casa(imagem, grade, linha, 0, .03, .04, .26, .34)
+    if not recorte.size:
+        return None
+    fundo = np.median(recorte.reshape(-1, 3), axis=0)
+    mascara = (np.linalg.norm(recorte - fundo, axis=2) > 70).astype(np.uint8)
+    contornos, hierarquia = cv2.findContours(
+        mascara, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if hierarquia is None:
+        return None
+    for contorno, (_, _, filho, pai) in zip(contornos, hierarquia[0]):
+        x, y, largura, altura = cv2.boundingRect(contorno)
+        if pai != -1 or not .11 <= altura / grade.tamanho <= .22:
+            continue
+        isolado = (
+            x > 0 and y > 0
+            and x + largura < mascara.shape[1]
+            and y + altura < mascara.shape[0]
+        )
+        if not isolado:
+            continue
+        if filho != -1 and hierarquia[0][filho][0] != -1 and .52 <= largura / altura <= .85:
+            return 8
+        if filho == -1 and .30 <= largura / altura <= .60:
+            # O 1 tem uma haste vertical estreita abaixo do traço superior.
+            haste = mascara[y + altura // 2:y + altura, x:x + largura]
+            if np.all(np.sum(haste, axis=1) <= .65 * largura):
+                return 1
+    return None
+
+
+def detectar_orientacao(imagem, grade):
+    """Lê o 1 e o 8 das coordenadas visíveis na lateral do tabuleiro."""
+    topo = _ler_numero_fileira(imagem, grade, 0)
+    baixo = _ler_numero_fileira(imagem, grade, 7)
+    return {(8, 1): chess.WHITE, (1, 8): chess.BLACK}.get((topo, baixo))
+
+
+def detectar_lances_destacados(imagem, grade, pecas, orientacao):
+    """Retorna pares de origem e destino compatíveis com os destaques."""
+    fundos = [[], []]
+    amostras = {}
+    for linha in range(8):
+        for coluna in range(8):
+            # As peças ocupam o centro da casa. Amostra abaixo das coordenadas.
+            recorte = _recortar_casa(imagem, grade, linha, coluna, .06, .78, .19, .91)
+            if not recorte.size:
+                continue
+            cor = np.median(recorte.reshape(-1, 3), axis=0)
+            amostras[linha, coluna] = cor
+            fundos[(linha + coluna) % 2].append(cor)
+
+    if not all(fundos):
+        return []
+    fundos = [np.median(grupo, axis=0) for grupo in fundos]
+    destaques = []
+    for (linha, coluna), (azul, verde, vermelho) in amostras.items():
+        b, g, r = fundos[(linha + coluna) % 2]
+        # Os destaques de lance reduzem o azul relativo ao vermelho.
+        # O teste também cobre o destaque marrom presente nas capturas.
+        if (
+            (vermelho - azul) - (r - b) >= 20
+            and (verde - azul) - (g - b) >= -22
+            and vermelho >= verde - 24
+        ):
+            destaques.append((linha, coluna))
+    # Uma seleção do jogador pode acrescentar uma terceira casa destacada.
+    if len(destaques) not in (2, 3):
+        return []
+    origens = [casa_de(*casa, orientacao) for casa in destaques if casa not in pecas]
+    destinos = [casa_de(*casa, orientacao) for casa in destaques if casa in pecas]
+    return [(origem, destino) for origem in origens for destino in destinos]
+
+
 def carregar_referencias(pasta="referencias"):
     """Carrega as imagens de referência e pré-calcula as máscaras de peça."""
     referencias = {}
@@ -151,7 +237,7 @@ def _pixels_ui(imagem):
     return selecao > 0
 
 
-def _mascara_primeiro_plano(imagem):
+def _mascara_primeiro_plano(imagem, rodape=False):
     """Máscara dos pixels que não pertencem ao fundo da casa."""
     altura, largura = imagem.shape[:2]
     if altura < 8 or largura < 8:
@@ -193,6 +279,9 @@ def _mascara_primeiro_plano(imagem):
     mascara = (distancias > LIMIAR_FUNDO).astype(np.uint8) * 255
     mascara = mascara.reshape(altura, largura)
     mascara[_pixels_ui(imagem)] = 0
+    if rodape:
+        # A letra da coluna pode encostar na base da peça e alterar o recorte.
+        mascara[round(altura * 0.78):, round(largura * 0.82):] = 0
 
     kernel = np.ones((3, 3), np.uint8)
     mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel)
@@ -478,7 +567,7 @@ def detectar_pecas(regiao_tabuleiro, referencias, limiar=0.40, grade_tabuleiro=N
                 continue
 
             if referencias:
-                mascara = _mascara_primeiro_plano(casa)
+                mascara = _mascara_primeiro_plano(casa, rodape=linha == 7)
                 if mascara is None:
                     continue
                 resultado = _normalizar_peca(casa, mascara)
@@ -651,36 +740,110 @@ def mapear_pecas(grade, cor_jogador):
 
 def montar_board(pecas, turno):
     """Monta o tabuleiro python-chess a partir das peças detectadas."""
+    if pecas == POSICAO_INICIAL and turno == chess.WHITE:
+        return chess.Board()
+
     board = chess.Board()
     board.clear()
 
     for casa, simbolo in pecas.items():
-        try:
-            board.set_piece_at(chess.parse_square(casa), chess.Piece.from_symbol(simbolo))
-        except Exception:
-            continue
+        board.set_piece_at(chess.parse_square(casa), chess.Piece.from_symbol(simbolo))
 
     board.turn = turno
-    _aplicar_direitos_roque(board)
     return board
 
 
-def _aplicar_direitos_roque(board):
-    """Concede roque quando rei e torre estão nas casas iniciais."""
-    def ocupada(casa, simbolo):
-        peca = board.piece_at(casa)
-        return peca is not None and peca.symbol() == simbolo
+def tabuleiros_possiveis(pecas):
+    if pecas == POSICAO_INICIAL:
+        return [chess.Board()]
+    candidatos = [montar_board(pecas, turno) for turno in (chess.WHITE, chess.BLACK)]
+    return [board for board in candidatos if board.is_valid()]
 
-    direitos = board.castling_rights
-    if ocupada(chess.E1, "K") and ocupada(chess.H1, "R"):
-        direitos |= chess.BB_H1
-    if ocupada(chess.E1, "K") and ocupada(chess.A1, "R"):
-        direitos |= chess.BB_A1
-    if ocupada(chess.E8, "k") and ocupada(chess.H8, "r"):
-        direitos |= chess.BB_H8
-    if ocupada(chess.E8, "k") and ocupada(chess.A8, "r"):
-        direitos |= chess.BB_A8
-    board.castling_rights = direitos
+
+def board_apos_ultimo_lance(candidatos, ultimo_lance):
+    """Confere se a peça de destino poderia ter saído da origem destacada."""
+    if ultimo_lance is None:
+        return None
+    origem, destino = map(chess.parse_square, ultimo_lance)
+    for board in candidatos:
+        peca = board.piece_at(destino)
+        if peca is None or peca.color == board.turn or board.piece_at(origem):
+            continue
+
+        anterior = board.copy(stack=False)
+        anterior.turn = peca.color
+        anterior.remove_piece_at(destino)
+        anterior.set_piece_at(origem, peca)
+        promocao = None
+        if peca.piece_type == chess.KING and abs(origem - destino) == 2:
+            lado_rei = destino > origem
+            casa_torre = origem + (3 if lado_rei else -4)
+            destino_torre = origem + (1 if lado_rei else -1)
+            torre = chess.Piece(chess.ROOK, peca.color)
+            rei_inicio = chess.E1 if peca.color else chess.E8
+            if (
+                origem != rei_inicio
+                or board.piece_at(destino_torre) != torre
+                or board.piece_at(casa_torre) is not None
+            ):
+                continue
+            anterior.remove_piece_at(destino_torre)
+            anterior.set_piece_at(casa_torre, torre)
+            anterior.castling_rights = chess.BB_SQUARES[casa_torre]
+
+        penultima, ultima = (6, 7) if peca.color else (1, 0)
+        if (
+            peca.piece_type in (chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT)
+            and chess.square_rank(origem) == penultima
+            and chess.square_rank(destino) == ultima
+            and abs(chess.square_file(origem) - chess.square_file(destino)) <= 1
+            and not anterior.is_legal(chess.Move(origem, destino))
+        ):
+            promocao = peca.piece_type
+            anterior.set_piece_at(origem, chess.Piece(chess.PAWN, peca.color))
+        if (peca.piece_type == chess.PAWN or promocao) and (
+            chess.square_file(origem) != chess.square_file(destino)
+        ):
+            # A peça capturada não está mais visível. Basta ocupar a casa
+            # para verificar a geometria da captura do peão.
+            anterior.set_piece_at(destino, chess.Piece(chess.KNIGHT, not peca.color))
+
+        lance = chess.Move(origem, destino, promotion=promocao)
+        if anterior.is_legal(lance):
+            anterior.push(lance)
+            if anterior.board_fen() == board.board_fen():
+                resultado = board.copy(stack=False)
+                resultado.ep_square = anterior.ep_square
+                return resultado
+    return None
+
+
+def sincronizar_pelo_destaque(candidatos, lances):
+    """Usa o destaque quando apenas um lance é compatível com a posição."""
+    resultado = None
+    for lance in lances:
+        board = board_apos_ultimo_lance(candidatos, lance)
+        if board is not None:
+            if resultado is not None:
+                return None
+            resultado = board
+    return resultado
+
+
+def avancar_posicao(anteriores, posicao):
+    """Aplica um lance legal que reproduza as casas observadas."""
+    fen_pecas = posicao.board_fen()
+    for anterior in anteriores:
+        teste = anterior.copy(stack=False)
+        for lance in anterior.legal_moves:
+            teste.push(lance)
+            confere = teste.board_fen() == fen_pecas
+            teste.pop()
+            if confere:
+                resultado = anterior.copy()
+                resultado.push(lance)
+                return resultado
+    return None
 
 
 def validar_posicao(pecas):
@@ -719,34 +882,6 @@ def validar_posicao(pecas):
             return False, "peão na última fileira"
 
     return True, ""
-
-
-def inferir_lado_movido(pecas_antigas, pecas_novas):
-    """Descobre qual cor fez o último lance comparando as duas posições."""
-    dados = {}
-    for brancas in (True, False):
-        antigas = {c: s for c, s in pecas_antigas.items() if s.isupper() == brancas}
-        novas = {c: s for c, s in pecas_novas.items() if s.isupper() == brancas}
-        ganhos = sum(1 for casa, simbolo in novas.items() if antigas.get(casa) != simbolo)
-        perdas = sum(1 for casa, simbolo in antigas.items() if novas.get(casa) != simbolo)
-        dados[brancas] = (ganhos, perdas)
-
-    ganhos_brancas, perdas_brancas = dados[True]
-    ganhos_pretas, perdas_pretas = dados[False]
-
-    if ganhos_brancas > 0 and ganhos_pretas == 0:
-        return chess.WHITE
-    if ganhos_pretas > 0 and ganhos_brancas == 0:
-        return chess.BLACK
-    if ganhos_brancas > ganhos_pretas:
-        return chess.WHITE
-    if ganhos_pretas > ganhos_brancas:
-        return chess.BLACK
-    if perdas_brancas > 0 and perdas_pretas == 0:
-        return chess.WHITE
-    if perdas_pretas > 0 and perdas_brancas == 0:
-        return chess.BLACK
-    return None
 
 
 def transicao_plausivel(pecas_antigas, pecas_novas):
