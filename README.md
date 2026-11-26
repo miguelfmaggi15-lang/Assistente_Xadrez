@@ -71,9 +71,12 @@ a peça sugerida e o estado da leitura.
 Ajustes comuns ficam no topo de `assistente_automatico.py`:
 
 - `PROFUNDIDADE_STOCKFISH` (padrão 15)
-- `TEMPO_STOCKFISH_MS` (padrão 1500)
-- `INTERVALO_LEITURA` (padrão 1 segundo)
+- `TEMPO_STOCKFISH_MS` (padrão 500 ms)
+- `INTERVALO_LEITURA` (padrão 0,30 s entre leituras)
 - `LIMIAR_TEMPLATE` (padrão 0.40)
+
+Para dar mais tempo ao Stockfish em posições complexas, rode
+`python assistente_automatico.py --tempo-stockfish-ms 1500`.
 
 ## Testes
 

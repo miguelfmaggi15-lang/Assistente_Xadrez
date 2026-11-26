@@ -42,9 +42,10 @@ from painel import Painel
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-INTERVALO_LEITURA = 1.0
+INTERVALO_LEITURA = 0.30
+INTERVALO_CONFIRMACAO_FIM = 1.0
 PROFUNDIDADE_STOCKFISH = 15
-TEMPO_STOCKFISH_MS = 1500
+TEMPO_STOCKFISH_MS = 500
 TIMEOUT_STOCKFISH = 8.0
 LIMIAR_TEMPLATE = 0.40
 CONFIRMACOES_FIM = 5
@@ -61,10 +62,11 @@ def _abrir_mss():
 
 
 class AssistenteXadrez:
-    def __init__(self, orientacao=None):
+    def __init__(self, orientacao=None, tempo_stockfish_ms=TEMPO_STOCKFISH_MS):
         print("Assistente de Xadrez")
         print("Abra uma partida contra um bot no Chrome. Ctrl+C encerra o assistente.\n")
         print("Stockfish  | Iniciando motor")
+        self.tempo_stockfish_ms = tempo_stockfish_ms
         self.engine_proc = None
         self._fila_respostas = queue.Queue()
         self._req_id = 0
@@ -109,7 +111,7 @@ class AssistenteXadrez:
         try:
             ambiente = os.environ.copy()
             ambiente["SF_DEPTH"] = str(PROFUNDIDADE_STOCKFISH)
-            ambiente["SF_MOVETIME"] = str(TEMPO_STOCKFISH_MS)
+            ambiente["SF_MOVETIME"] = str(self.tempo_stockfish_ms)
             self.engine_proc = subprocess.Popen(
                 ["node", str(NOME_HELPER)],
                 env=ambiente,
@@ -127,9 +129,8 @@ class AssistenteXadrez:
             self._ultimo_fen_enviado = None
             self._jogada_cache_uci = None
             self._jogada_cache_desc = None
-            time.sleep(0.4)
             if anunciar:
-                print("Stockfish  | Motor carregado")
+                print("Stockfish  | Processo iniciado")
             return True
         except Exception as erro:
             print(f"Stockfish  | Erro ao iniciar: {erro}")
@@ -196,10 +197,11 @@ class AssistenteXadrez:
             self._iniciar_engine(anunciar=False)
             return None, None
 
-        prazo = time.time() + TIMEOUT_STOCKFISH
+        timeout = max(TIMEOUT_STOCKFISH, self.tempo_stockfish_ms / 1000 + 2)
+        prazo = time.monotonic() + timeout
         jogada = None
         while True:
-            restante = prazo - time.time()
+            restante = prazo - time.monotonic()
             if restante <= 0:
                 break
             try:
@@ -375,7 +377,6 @@ class AssistenteXadrez:
             if janela.isMinimized:
                 janela.restore()
             janela.activate()
-            time.sleep(1.0)
             return True
         except Exception as erro:
             print(f"Chrome     | Falha ao trazer a janela para frente: {erro}")
@@ -422,6 +423,9 @@ class AssistenteXadrez:
         self._posicionar_overlay()
         self._registrar_log(f"--- sessão iniciada | monitor={self.monitor_indice} ---")
         print("\nTabuleiro  | Procurando no Chrome")
+        ultima_regiao = None
+        ultima_grade = None
+        ultima_leitura = None
 
         try:
             while self.partida_ativa:
@@ -478,9 +482,13 @@ class AssistenteXadrez:
                             "está inteiro na tela."
                         )
 
-                grade, confiancas = deteccao.detectar_pecas(
-                    regiao, self.referencias, LIMIAR_TEMPLATE, self._grade
-                )
+                if self._grade != ultima_grade or not np.array_equal(regiao, ultima_regiao):
+                    ultima_leitura = deteccao.detectar_pecas(
+                        regiao, self.referencias, LIMIAR_TEMPLATE, self._grade
+                    )
+                    ultima_regiao = regiao.copy()
+                    ultima_grade = self._grade
+                grade, confiancas = ultima_leitura
                 if len(grade) < MIN_PECAS_LEITURA:
                     self._pecas_pendentes = None
                     self._marcar_leitura_instavel()
@@ -589,7 +597,7 @@ class AssistenteXadrez:
                         f"Posição    | Confirmando fim de partida "
                         f"({self.contador_partida_encerrada}/{CONFIRMACOES_FIM})..."
                     )
-                    self._dormir()
+                    self._dormir(INTERVALO_CONFIRMACAO_FIM)
                     continue
                 self.contador_partida_encerrada = 0
 
@@ -739,9 +747,9 @@ class AssistenteXadrez:
             print(mensagem)
             self._mensagem_status = mensagem
 
-    def _dormir(self):
+    def _dormir(self, intervalo=INTERVALO_LEITURA):
         self._atualizar_tk()
-        time.sleep(INTERVALO_LEITURA)
+        time.sleep(intervalo)
 
 
 if __name__ == "__main__":
@@ -750,7 +758,13 @@ if __name__ == "__main__":
         "--orientacao", choices=("brancas", "pretas"),
         help="cor das peças na parte de baixo, caso as coordenadas estejam ocultas",
     )
+    parser.add_argument(
+        "--tempo-stockfish-ms", type=int, default=TEMPO_STOCKFISH_MS,
+        help=f"tempo de análise por jogada em milissegundos (padrão {TEMPO_STOCKFISH_MS})",
+    )
     opcoes = parser.parse_args()
+    if opcoes.tempo_stockfish_ms < 1:
+        parser.error("--tempo-stockfish-ms deve ser maior que zero")
     orientacao = {"brancas": chess.WHITE, "pretas": chess.BLACK}.get(opcoes.orientacao)
-    assistente = AssistenteXadrez(orientacao)
+    assistente = AssistenteXadrez(orientacao, opcoes.tempo_stockfish_ms)
     assistente.executar()
